@@ -13,7 +13,7 @@ from schem.components import Reactor, RandomInput
 from schem.grid import CARDINAL_DIRECTIONS, Direction, Position
 from schem.waldo import Waldo, Instruction, InstructionType
 
-from human_scores import get_top_score
+from human_scores import top_human_score_weighted
 
 ROTATIONAL_DIRECTIONS = (Direction.CLOCKWISE, Direction.COUNTER_CLOCKWISE)
 NUM_WALDOS, NUM_COLS, NUM_ROWS = Reactor.NUM_WALDOS, Reactor.NUM_COLS, Reactor.NUM_ROWS
@@ -24,7 +24,7 @@ FEATURE_IDX_TO_NAME = ['bonder-plus', 'bonder-minus', 'sensor', 'fuser', 'splitt
 # Parts of the observation space that are common across env types
 # TODO: Scale to handle production levels
 # Current space size (ignoring types): 3 + 480 + 4 + 128 + 128 + 320 + 168 + 640 + 2400 + 640 + 160 + 160 = 5231
-observation_dict = {
+shared_observation_dict = {
     'optimization_target': Box(shape=(3,), dtype=float, low=0, high=1),  # Cycles, Reactors, Symbols
     # One-hot encoding of all reactor features, except +- bonders which are stored as a 1 in both the + and -
     # bonder sections: (bonder+, bonder-, sensor, fuser, splitter, swapper).
@@ -34,15 +34,15 @@ observation_dict = {
     'target_output_counts': Box(shape=(2,), dtype=np.int8, low=0, high=127),
     'current_output_counts': Box(shape=(2,), dtype=np.int8, low=0, high=127),
     # Input molecule details (both zones)
-    'input_atoms': Box(shape=(2, 4, 4), dtype=np.int8, low=0, high=204),
+    'input_atoms': Box(shape=(2, 4, 4), dtype=np.int16, low=0, high=204),
     'input_atoms_max_bonds': Box(shape=(2, 4, 4), dtype=np.int8, low=0, high=12),
     'input_bonds': Box(shape=(2, 4, 4, 2), dtype=np.int8, low=0, high=3),  # (right, down)
     # Output molecule details (both zones)
-    'output_atoms': Box(shape=(2, 4, 4), dtype=np.int8, low=0, high=204),
+    'output_atoms': Box(shape=(2, 4, 4), dtype=np.int16, low=0, high=204),
     'output_atoms_max_bonds': Box(shape=(2, 4, 4), dtype=np.int8, low=0, high=12),
     'output_bonds': Box(shape=(2, 4, 4, 2), dtype=np.int8, low=0, high=3),  # (right, down)
     # Molecules currently in the reactor
-    'atoms': Box(shape=(NUM_ROWS, NUM_COLS), dtype=np.int8, low=0, high=204),  # 0 = no atom
+    'atoms': Box(shape=(NUM_ROWS, NUM_COLS), dtype=np.int16, low=0, high=204),  # 0 = no atom
     'atoms_max_bonds': Box(shape=(NUM_ROWS, NUM_COLS), dtype=np.int8, low=0, high=12),
     'bonds': Box(shape=(NUM_ROWS, NUM_COLS, 2), dtype=np.int8, low=0, high=3),  # (right, down)
     # Mid-run waldo attributes. One-hot encoded; observation_space.sample() will behave poorly...
@@ -65,9 +65,100 @@ observation_dict = {
     # the UP & DOWN encodings for each to preserve them being 'opposites'.
     'waldo_command_directions': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS, 4), dtype=bool, low=0, high=1),
     # Element associated with Sense commands (note that it can't be Australium)
-    'waldo_command_elements': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=np.int8, low=1, high=203),
+    'waldo_command_elements': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=np.int16, low=1, high=203),
     # 1 if there is an active flip-flop in the given position
     'waldo_flip_flop_states': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=bool, low=0, high=1)}
+
+
+# Populate the parts of the envs' obervation spaces that are shared in shared_observation_dict above.
+_instr_type_to_index = {instr_type: i for i, instr_type in enumerate(schem.waldo.InstructionType)}
+def _shared_observation(solution: Solution,
+                        optimization_goal: tuple[float, float, float],
+                        include_waldo_layers=True):
+    """Given a research schem.Solution object currently being run, return an observation formatted as defined by
+    observation_space. TODO: Support production levels too
+    Waldo static layers:
+      These might improve an agent's ability to associate its actions to their effects on the environment,
+      but they also greatly increase the size of the observation space due to the necessity of one-hot encoding.
+      Set include_waldo_layers=False to disable.
+      - three 8x10 input/output atom layers, encoded in the same way as the active molecules layer, with
+        inputs/outputs in their respective zones and the middle columns unused.
+      - two 8x10 input/output right/down bond layers, similarly to the active molecules layer.
+      - Six 8x10 layers representing the locations of features (bonders+, bonders-, sensors, fusers, splitters,
+        tunnels). Regular +/- bonders have a 1 in both + and - layers. Double-wide features have only the left
+        position encoded.
+        Priority orders are consistent with the order of placement but not represented in observations.
+      - Thirty-two (2x16) 8x10 layers representing one-hot encodings of the currently placed symbols for each waldo.
+        The sense layer will use normalized 0-1 values representing the sensor element, similarly to the
+        representation of atoms.
+    """
+    obs = gym.vector.utils.numpy_utils.create_empty_array(shared_observation_dict)
+
+    for i, metric_weight in enumerate(optimization_goal):
+        obs['optimization_target'][i] = metric_weight
+
+    # schem handles bonders differently since they mix priorities with plus vs minus bonders; store the correct type
+    # (and store as both + and - for regular +- bonders).
+    # For now I'm hiding feature priorities from the agent like OG SC.
+    for (c, r), bond_type in solution.bonders:
+        if '+' in bond_type:
+            obs['features'][r][c][0] = 1
+        if '-' in bond_type:
+            obs['features'][r][c][1] = 1
+
+    for i, feature in enumerate(('sensors', 'fusers', 'splitters', 'swappers')):
+        for c, r in getattr(solution, feature):
+            # Note that fusers and splitters store only their left position. This is probably preferable.
+            obs['features'][r][c][i + 3] = 1
+
+    for i, input in solution.inputs:
+        for (c, r), atom in input.input_molecule.atom_map:
+            obs['input_atoms'][i][r][c] = atom.element.atomic_num
+            obs['input_atoms_max_bonds'][i][r][c] = atom.element.max_bonds
+            obs['input_bonds'][i][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
+            obs['input_bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
+
+    for i, output in solution.outputs:
+        obs['target_output_counts'][i] = output.count
+        molecule = output.output_molecule
+        for (c, r), atom in molecule.atom_map.items():
+            obs['output_atoms'][i][r][c] = atom.element.atomic_num
+            obs['output_atoms_max_bonds'][i][r][c] = atom.element.max_bonds
+            obs['output_bonds'][i]
+            obs['output_bonds'][i][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
+            obs['output_bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
+
+    reactor = solution.reactors[0]
+    for molecule in reactor.molecules:
+        for (c, r), atom in molecule.atom_map.items():
+            obs['atoms'][r][c] = atom.element.atomic_num
+            obs['atoms_max_bonds'][r][c] = atom.element.max_bonds
+            obs['bonds'][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
+            obs['bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
+
+    if include_waldo_layers:
+        for w, waldo in reactor.waldos:
+            obs['waldo_positions'][w][waldo.position.row][waldo.position.col] = 1
+            obs['waldo_directions'][w][waldo.direction.value] = 1
+            for (c, r), arrow in waldo.arrows.items():
+                obs['waldo_arrows'][w][r][c][arrow.value] = 1
+            for (c, r), cmd in waldo.commands.items():
+                obs['waldo_commands'][w][r][c][_instr_type_to_index[cmd.type]] = 1
+                if cmd.direction is not None:
+                    # Convert rotate's CLOCKWISE = 5 and COUNTERCLOCKWISE = 7 to 0 and 2 respectively
+                    dirn_idx = cmd.direction.value if cmd.direction.value < 4 else cmd.direction.value - 5
+                    obs['waldo_command_directions'][w][r][c][dirn_idx] = 1
+
+                if cmd.type == schem.waldo.InstructionType.SENSE:
+                    obs['waldo_command_elements'][w][r][c] = cmd.target_idx
+                elif cmd.target_idx is not None:  # Input/Ouput: 0 (UP) for alpha/psi, 2 (DOWN) for beta/omega
+                    obs['waldo_command_directions'][w][r][c][2 * cmd.target_idx] = 1
+
+            for (c, r), active in waldo.flipflop_states.items():
+                if active:
+                    obs['waldo_flip_flop_states'][w][r][c] = 1
+
+    return obs
 
 
 # TODO: It is probably better to avoid this 'alternating actions' scheme and have each step() accept both an arrow
@@ -102,9 +193,9 @@ class SChemEnvJustInTime(gym.Env):
     last_level_solved = -1
     #max_training_level
 
-    def __init__(self):
+    def __init__(self, optimization_goal=(0.99, 0, 0.01), render_mode=None):
         # Gymnasium API properties
-        self.observation_space = Dict({**observation_dict,
+        self.observation_space = Dict({**shared_observation_dict,
                                        # Number of each feature the solution will include
                                        'total_features': Box(shape=(6,), dtype=np.int8, low=0, high=8),
                                        # Helper feature so the agent doesn't have to learn what order features get
@@ -129,6 +220,9 @@ class SChemEnvJustInTime(gym.Env):
         self.level = schem.Level(next(iter(schem.levels.values())))  # Of Pancakes and Spaceships
         self.solution = schem.Solution(None, level=self.level)
         self._reactor = next(self.solution.reactors)
+        self.optimization_goal = optimization_goal
+        self.top_human_score, self.top_human_score_weighted = top_human_score_weighted(self.level.name,
+                                                                                       metric_weights=optimization_goal)
 
         # Check which waldo command action indices are illegal (will be ignored)
         self.disallowed_command_actions = set()
@@ -152,9 +246,8 @@ class SChemEnvJustInTime(gym.Env):
         self._placed_waldo_starts = False
 
         # Problem: schem doesn't allow initializing a solution with no features or waldo start commands.
-        # We're going to have to 'hide' them from the agent until we're done feature/Start placement.
-
-        # Rip out the reactor's features and Start instructions. We'll make sure to put them back.
+        # We have to 'hide' them from the agent until we're done feature/Start placement.
+        # Rip out the reactor's features and Start instructions. We'll put them back, promise.
         expected_features = []
         for reactor in self.solution.reactors:
             expected_features.append(schem.components.REACTOR_TYPES[reactor.type])
@@ -165,22 +258,30 @@ class SChemEnvJustInTime(gym.Env):
             reactor.splitters = []
             reactor.swappers = []
 
+    def _observation(self):
+        """Return an observation of the env's current state."""
+        obs = _shared_observation(solution=self.solution, optimization_goal=self.optimization_goal,
+                                  include_waldo_layers=True)
+        # Add parts of the observation specific to this variant of the env
+        obs['waldo_being_placed'] = self.active_waldo
+        return obs
+
     def step(self, action):
-        state, reward, done, info = [], 0, False, {}
-
+        state, reward, terminated, truncated, info = [], 0, False, False, {}
         reactor = self._reactor
-        if not self._placed_features:
 
+        if not self._placed_features:
             # Check how many features we have left to place
 
             self._placed_features = True
             # Re-init Reactor's bonder pair helper properties
             reactor.bond_plus_pairs, reactor.bond_minus_pairs = reactor.bond_pairs()
 
-            return state, reward, done, info
+            return state, reward, terminated, truncated, info
 
         # Skip command/arrow placement if the current waldo has already visited this cell
-        if reactor.waldos[self.active_waldo].position not in self._visited_posns[self.active_waldo]:
+        if (len(reactor.waldos) < 2
+                or reactor.waldos[self.active_waldo].position not in self._visited_posns[self.active_waldo]):
             posn = Position(col=action['col'][0], row=action['row'][0])
             dirn = CARDINAL_DIRECTIONS[action['command_direction']]
 
@@ -203,7 +304,6 @@ class SChemEnvJustInTime(gym.Env):
                 waldo = reactor.waldos[self.active_waldo]
                 waldo.commands[waldo.position] = Instruction(instr_type, direction=dirn, target_idx=target_idx)
 
-
             waldo = reactor.waldos[self.active_waldo]
 
             # Place arrow
@@ -217,16 +317,28 @@ class SChemEnvJustInTime(gym.Env):
         # After blue waldo placements, execute movement phase
         if self.active_waldo == 1:
             self.solution.cycle += 1
-            reactor.do_instant_actions(self.solution.cycle)
+
+            # Instant actions + check for completion. Bit of DRY violation with schem here.
+            for component in self.solution.components:
+                if (component.do_instant_actions(self.solution.cycle)  # True if it's an Output that just completed
+                        and all(output.current_count >= output.target_count for output in self.solution.outputs)):
+                    score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
+                    # Weighted sum as compared to human best (inverse since weighted score is being minimized)
+                    reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
+                    return state, reward, True, truncated, info
+
             self.solution.cycle_movement()
-            self.solution.does_it_halt()
-            # TODO: Check if the solve is complete
+
+            if self.solution.does_it_halt():  # Detects infinite loops and fast-forwards cycles to completion
+                score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
+                # Weighted sum as compared to human best (inverse since weighted score is being minimized)
+                reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
+                return state, reward, True, truncated, info
 
         self.active_waldo = 1 - self.active_waldo  # Flip waldo
 
-        return state, reward, done, info
-
-        # TODO: Check if the solve is complete
+        #state = self._observation()
+        return state, reward, terminated, truncated, info
 
     def reset(self):
         # TODO: Change levels if the agent beat the current level?
@@ -252,7 +364,7 @@ class SChemEnvOneShot(gym.Env):
 
     def __init__(self, optimization_goal=(0.9999, 0, 0.0001)):
         # gym API properties
-        self.observation_space = Dict({**observation_dict})
+        self.observation_space = Dict({**shared_observation_dict})  # This env has no special state values
 
         # TODO: Space.sample() has a bug where dtype=bool always samples as all true, using int8 for now.
         self.action_space = Dict({
@@ -273,93 +385,17 @@ class SChemEnvOneShot(gym.Env):
             # Element associated with Sense commands (note that sensors can't be set to Australium=204)
             'waldo_command_elements': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=np.int16, low=1, high=203)})
 
-        # Normalize goal so it sums to 1 to prevent reward bloat. Yes float errors spooky but it seems to work fine
-        self.optimization_goal = tuple(subgoal / sum(optimization_goal) for subgoal in optimization_goal)
         self.level = schem.Level(schem.levels["Of Pancakes and Spaceships"])
         self.solution = schem.Solution(None, level=self.level)
+        # Normalize goal so it sums to 1 to prevent reward bloat.
+        self.optimization_goal = tuple(subgoal / sum(optimization_goal) for subgoal in optimization_goal)
+        self.top_human_score, self.top_human_score_weighted = top_human_score_weighted(self.level.name,
+                                                                                       metric_weights=self.optimization_goal)
 
-    _instr_type_to_index = {instr_type: i for i, instr_type in enumerate(schem.waldo.InstructionType)}
-    def solution_to_observation(self, solution: Solution, include_static_layers=True):
-        """Given a research schem.Solution object currently being run, return an observation formatted as defined by
-        observation_space. TODO: Support production levels too
-        Waldo static layers:
-          These might improve an agent's ability to associate its actions to their effects on the environment,
-          but they also greatly increase the size of the observation space due to the necessity of one-hot encoding.
-          Set include_static_layers=False to disable.
-          - three 8x10 input/output atom layers, encoded in the same way as the active molecules layer, with
-            inputs/outputs in their respective zones and the middle columns unused.
-          - two 8x10 input/output right/down bond layers, similarly to the active molecules layer.
-          - Six 8x10 layers representing the locations of features (bonders+, bonders-, sensors, fusers, splitters,
-            tunnels). Regular +/- bonders have a 1 in both + and - layers. Double-wide features have only the left
-            position encoded.
-            Priority orders are consistent with the order of placement but not represented in observations.
-          - Thirty-two (2x16) 8x10 layers representing one-hot encodings of the currently placed symbols for each waldo.
-            The sense layer will use normalized 0-1 values representing the sensor element, similarly to the
-            representation of atoms.
-        """
-        obs = gym.vector.utils.numpy_utils.create_empty_array(self.observation_space)
-
-        # schem handles bonders differently since they mix priorities with plus vs minus bonders; store the correct type
-        # (and store as both + and - for regular +- bonders).
-        # For now I'm hiding feature priorities from the agent like OG SC.
-        for (c, r), bond_type in solution.bonders:
-            if '+' in bond_type:
-                obs['features'][r][c][0] = 1
-            if '-' in bond_type:
-                obs['features'][r][c][1] = 1
-
-        for i, feature in enumerate(('sensors', 'fusers', 'splitters', 'swappers')):
-            for c, r in getattr(solution, feature):
-                # Note that fusers and splitters store only their left position. This is probably preferable.
-                obs['features'][r][c][i + 3] = 1
-
-        for i, input in solution.inputs:
-            for (c, r), atom in input.input_molecule.atom_map:
-                obs['input_atoms'][i][r][c] = atom.element.atomic_num
-                obs['input_atoms_max_bonds'][i][r][c] = atom.element.max_bonds
-                obs['input_bonds'][i][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
-                obs['input_bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
-
-        for i, output in solution.outputs:
-            obs['target_output_counts'][i] = output.count
-            molecule = output.output_molecule
-            for (c, r), atom in molecule.atom_map.items():
-                obs['output_atoms'][i][r][c] = atom.element.atomic_num
-                obs['output_atoms_max_bonds'][i][r][c] = atom.element.max_bonds
-                obs['output_bonds'][i]
-                obs['output_bonds'][i][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
-                obs['output_bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
-
-        reactor = solution.reactors[0]
-        for molecule in reactor.molecules:
-            for (c, r), atom in molecule.atom_map.items():
-                obs['atoms'][r][c] = atom.element.atomic_num
-                obs['atoms_max_bonds'][r][c] = atom.element.max_bonds
-                obs['bonds'][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
-                obs['bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
-
-        for w, waldo in reactor.waldos:
-            obs['waldo_positions'][w][waldo.position.row][waldo.position.col] = 1
-            obs['waldo_directions'][w][waldo.direction.value] = 1
-            for (c, r), arrow in waldo.arrows.items():
-                obs['waldo_arrows'][w][r][c][arrow.value] = 1
-            for (c, r), cmd in waldo.commands.items():
-                obs['waldo_commands'][w][r][c][_instr_type_to_index[cmd.type]] = 1
-                if cmd.direction is not None:
-                    # Convert rotate's CLOCKWISE = 5 and COUNTERCLOCKWISE = 7 to 0 and 2 respectively
-                    dirn_idx = cmd.direction.value if cmd.direction.value < 4 else cmd.direction.value - 5
-                    obs['waldo_command_directions'][w][r][c][dirn_idx] = 1
-
-                if cmd.type == schem.waldo.InstructionType.SENSE:
-                    obs['waldo_command_elements'][w][r][c] = cmd.target_idx
-                elif cmd.target_idx is not None:  # Input/Ouput: 0 (UP) for alpha/psi, 2 (DOWN) for beta/omega
-                    obs['waldo_command_directions'][w][r][c][2 * cmd.target_idx] = 1
-
-            for (c, r), active in waldo.flipflop_states.items():
-                if active:
-                    obs['waldo_flip_flop_states'][w][r][c] = 1
-
-        return obs
+    def _observation(self):
+        """Return an observation of the env's current state."""
+        return _shared_solution_to_observation(solution=self.solution, optimization_goal=self.optimization_goal,
+                                               include_waldo_layers=False)
 
     def update_solution(self, action):
         """Given an action, reset and fill in the solution."""
@@ -429,7 +465,7 @@ class SChemEnvOneShot(gym.Env):
         successful solution (if the optimization goal mixes multiple metrics, the human best for each individual metric
         is used, so a score of 1 will likely be unachievable).
 
-        Returns (state, reward, done, info); done is always true since this is a single-step env.
+        Returns (state, reward, terminated, truncated, info); terminated is always True since this is a single-step env.
         """
         info = {}
 
@@ -437,9 +473,8 @@ class SChemEnvOneShot(gym.Env):
             self.update_solution(action)
             score = self.solution.run(debug=schem.solution.DebugOptions(show_instructions=True))
 
-            # Weighted sum of the inverse fraction of the top human score, for each goal metric
-            reward = sum(self.optimization_goal[i] * (get_top_score(self.level.name, metric=i) / metric)
-                         for i, metric in enumerate(score))
+            # Weighted sum as compared to human best (inverse since weighted score is being minimized)
+            reward = self.top_human_score_weighted / sum(w * metric for w, metric in zip(self.optimization_goal, score))
         except SolutionImportError as e:
             reward = -2
             info['error'] = str(e)
@@ -448,16 +483,14 @@ class SChemEnvOneShot(gym.Env):
             info['error'] = str(e)
         # Any other exception would be a bug in the simulator and worth raising
 
-        # TODO: Observations should be for every cycle
-        #obs = self.solution_to_observation(self.solution, include_static_layers=True)
-        obs = None
-
-        return obs, reward, True, info
+        # TODO: Observations should be for every cycle...
+        return self._observation(), reward, True, False, info
 
     def reset(self):
         # TODO: Change levels if the agent beat the current level? If it reached X% of human best?
+        #       If it *asks* us to via a separate action control?
         self.solution = schem.Solution(None, level=self.Level)
-        obs = self.solution_to_observation(self.solution, include_static_layers=True)
+        obs = self._observation(self.solution, include_waldo_layers=True)
         info = {}
 
         return obs, info
@@ -506,7 +539,7 @@ if __name__ == '__main__':
         sample_action['waldo_commands'][0][np.random.randint(NUM_ROWS)][np.random.randint(NUM_COLS)][1] = 1
         sample_action['waldo_commands'][1][np.random.randint(NUM_ROWS)][np.random.randint(NUM_COLS)][1] = 1
 
-        obs, reward, done, info = env.step(sample_action)
+        obs, reward, terminated, truncated, info = env.step(sample_action)
         if 'error' in info:
             print(info['error'])
     else:
@@ -514,7 +547,7 @@ if __name__ == '__main__':
         env = SChemEnvJustInTime()
         try:
             while True:
-                obs, reward, done, info = env.step(env.action_space.sample())
+                obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
                 if 'error' in info:
                     print(info['error'])
                     break
