@@ -1,5 +1,6 @@
 import copy
 from enum import IntEnum
+import math
 
 import gymnasium as gym
 from gymnasium import error, spaces
@@ -10,7 +11,7 @@ import rich
 import schem
 from schem import *
 from schem.components import Reactor, RandomInput
-from schem.grid import CARDINAL_DIRECTIONS, Direction, Position
+from schem.grid import Direction, Position, CARDINAL_DIRECTIONS, RIGHT, DOWN
 from schem.waldo import Waldo, Instruction, InstructionType
 
 from human_scores import top_human_score_weighted
@@ -92,7 +93,10 @@ def _shared_observation(solution: Solution,
         The sense layer will use normalized 0-1 values representing the sensor element, similarly to the
         representation of atoms.
     """
-    obs = gym.vector.utils.numpy_utils.create_empty_array(shared_observation_dict)
+    #flattened_space = gym.spaces.utils.flatten_space(self.observation_space)
+    obs = {space_key: np.zeros(shape=space.shape, dtype=space.dtype)
+           for space_key, space in shared_observation_dict.items()}
+    reactor = next(solution.reactors)
 
     for i, metric_weight in enumerate(optimization_goal):
         obs['optimization_target'][i] = metric_weight
@@ -100,44 +104,43 @@ def _shared_observation(solution: Solution,
     # schem handles bonders differently since they mix priorities with plus vs minus bonders; store the correct type
     # (and store as both + and - for regular +- bonders).
     # For now I'm hiding feature priorities from the agent like OG SC.
-    for (c, r), bond_type in solution.bonders:
+    for (c, r), bond_type in reactor.bonders:
         if '+' in bond_type:
             obs['features'][r][c][0] = 1
         if '-' in bond_type:
             obs['features'][r][c][1] = 1
 
     for i, feature in enumerate(('sensors', 'fusers', 'splitters', 'swappers')):
-        for c, r in getattr(solution, feature):
+        for c, r in getattr(reactor, feature):
             # Note that fusers and splitters store only their left position. This is probably preferable.
             obs['features'][r][c][i + 3] = 1
 
-    for i, input in solution.inputs:
-        for (c, r), atom in input.input_molecule.atom_map:
+    for i, input in enumerate(solution.inputs):
+        for (c, r), atom in input.molecules[0].atom_map.items():
             obs['input_atoms'][i][r][c] = atom.element.atomic_num
             obs['input_atoms_max_bonds'][i][r][c] = atom.element.max_bonds
             obs['input_bonds'][i][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
             obs['input_bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
 
-    for i, output in solution.outputs:
-        obs['target_output_counts'][i] = output.count
-        molecule = output.output_molecule
-        for (c, r), atom in molecule.atom_map.items():
+    for i, output in enumerate(solution.outputs):
+        obs['target_output_counts'][i] = output.target_count
+        obs['current_output_counts'][i] = output.current_count
+        for (c, r), atom in output.output_molecule.atom_map.items():
             obs['output_atoms'][i][r][c] = atom.element.atomic_num
             obs['output_atoms_max_bonds'][i][r][c] = atom.element.max_bonds
             obs['output_bonds'][i]
             obs['output_bonds'][i][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
             obs['output_bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
 
-    reactor = solution.reactors[0]
     for molecule in reactor.molecules:
         for (c, r), atom in molecule.atom_map.items():
             obs['atoms'][r][c] = atom.element.atomic_num
             obs['atoms_max_bonds'][r][c] = atom.element.max_bonds
             obs['bonds'][r][c][0] = atom.bonds[RIGHT] if RIGHT in atom.bonds else 0
-            obs['bonds'][i][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
+            obs['bonds'][r][c][1] = atom.bonds[DOWN] if DOWN in atom.bonds else 0
 
     if include_waldo_layers:
-        for w, waldo in reactor.waldos:
+        for w, waldo in enumerate(reactor.waldos):
             obs['waldo_positions'][w][waldo.position.row][waldo.position.col] = 1
             obs['waldo_directions'][w][waldo.direction.value] = 1
             for (c, r), arrow in waldo.arrows.items():
@@ -191,7 +194,6 @@ class SChemEnvJustInTime(gym.Env):
     """
     metadata = {'render.modes': ['human']}
     last_level_solved = -1
-    #max_training_level
 
     def __init__(self, optimization_goal=(0.99, 0, 0.01), render_mode=None):
         # Gymnasium API properties
@@ -219,7 +221,7 @@ class SChemEnvJustInTime(gym.Env):
         # Internal vars
         self.level = schem.Level(next(iter(schem.levels.values())))  # Of Pancakes and Spaceships
         self.solution = schem.Solution(None, level=self.level)
-        self._reactor = next(self.solution.reactors)
+        reactor = next(self.solution.reactors)
         self.optimization_goal = optimization_goal
         self.top_human_score, self.top_human_score_weighted = top_human_score_weighted(self.level.name,
                                                                                        metric_weights=optimization_goal)
@@ -229,7 +231,7 @@ class SChemEnvJustInTime(gym.Env):
         instr_to_indices = {'instr-bond': {8, 9}, 'instr-sensor': {10}, 'instr-toggle': {11},
                             'instr-fuse': {12}, 'instr-split': {13}, 'instr-swap': {14},
                             'instr-control': set()}  # We exclude PAUSE and CTRL from the action space already
-        for disallowed_instr in self._reactor.disallowed_instrs:
+        for disallowed_instr in reactor.disallowed_instrs:
             self.disallowed_command_actions.update(instr_to_indices[disallowed_instr])
 
         # Need to init some schem-internal loop detection vars, since we're somewhat re-implementing its run() function
@@ -266,9 +268,56 @@ class SChemEnvJustInTime(gym.Env):
         obs['waldo_being_placed'] = self.active_waldo
         return obs
 
+    def fail_reward(self):
+        """The reward returned for a failed solution. Override this method to use a custom negative function (or just
+        ignore the reward output...).
+
+        By default provides a reward as follows:
+        * -10 baseline
+        * -10 if no bonders are connected in a level containing bonders.
+        * Up to +5 based on number of output zones with at least one successfully outputted molecule.
+        * Up to +3 for the closest chemical distance of any board molecule(s) from output zones with 0 successful
+                   outputs. The chemical distance will ~= the distance in terms of SC instructions (bond, fuse, etc.),
+                   and normalizing for the original chemical distances of the inputs from the outputs.
+        * Up to +1 if there is a molecule exactly matching any target output, based on its orthogonal distance from the
+                   output zone and whether it has been dropped in the output zone.
+        """
+        reward = -10
+        reactor = next(self.solution.reactors)
+        outputs = list(self.solution.outputs)
+
+        if len(reactor.bonders) >= 2 and len(reactor.bond_plus_pairs) == len(reactor.bond_minus_pairs) == 0:
+            reward -= 10
+
+        for o, output in enumerate(outputs):
+            # Bonus for doing at least one successful output
+            if output.current_count > 0:
+                reward += 5 / len(outputs)
+                continue
+
+            # TODO: Proper chemical distance AKA the hard one. Doesn't affect first level so being naive for now.
+            max_molecule_reward = 0
+            for molecule in reactor.molecules:
+                molecule_reward = 0
+                if molecule.isomorphic(output.output_molecule):
+                    molecule_reward += 3  # Bonus for exact output molecule being in grid
+
+                    # Measure distance of furthest atom of molecule from the relevant output zone
+                    grid_distance = max(max(6 - posn.col, 0) + (max(posn.row - 3, 0) if o == 0 else max(4 - posn.row))
+                                        for posn in molecule.atom_map)
+                    molecule_reward += 1 - grid_distance / 10  # 10 is the maximum possible grid distance
+                    grabbed = any(waldo.molecule is molecule for waldo in reactor.waldos)
+                    # Slightly reward grabbing a molecule outside the output zone and dropping it in it
+                    molecule_reward += (0.05 * grabbed) if grid_distance > 0 else (-0.05 * grabbed)
+
+                max_molecule_reward = max(max_molecule_reward, molecule_reward)
+            reward += max_molecule_reward
+
+        return reward
+
     def step(self, action):
         state, reward, terminated, truncated, info = [], 0, False, False, {}
-        reactor = self._reactor
+        reactor = next(self.solution.reactors)
 
         if not self._placed_features:
             # Check how many features we have left to place
@@ -293,7 +342,7 @@ class SChemEnvJustInTime(gym.Env):
                 instr_type = INSTR_IDX_TO_TYPE[action['command']]  # No-op action replaced Start, so no offset needed
                 dirn = (CARDINAL_DIRECTIONS[action['command_direction']]
                         if instr_type != InstructionType.ROTATE
-                        else ROTATIONAL_DIRECTIONS[action['command_direction'] <= 1])  # UP, RIGHT -> CLOCKWISE
+                        else ROTATIONAL_DIRECTIONS[action['command_direction'] % 2])
 
                 # Used by input/output and sense.
                 target_idx = (action['command_element']
@@ -318,33 +367,53 @@ class SChemEnvJustInTime(gym.Env):
         if self.active_waldo == 1:
             self.solution.cycle += 1
 
-            # Instant actions + check for completion. Bit of DRY violation with schem here.
-            for component in self.solution.components:
-                if (component.do_instant_actions(self.solution.cycle)  # True if it's an Output that just completed
-                        and all(output.current_count >= output.target_count for output in self.solution.outputs)):
+            try:
+                # Instant actions + check for completion. Bit of DRY violation with schem here.
+                for component in self.solution.components:
+                    if (component.do_instant_actions(self.solution.cycle)  # True if it's an Output that just completed
+                            and all(output.current_count >= output.target_count for output in self.solution.outputs)):
+                        score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
+                        # Weighted sum as compared to human best (inverse since weighted score is being minimized)
+                        reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
+                        return state, reward, True, truncated, info
+
+                self.solution.cycle_movement()
+
+                if self.solution.does_it_halt():  # Detects infinite loops and fast-forwards cycles to completion
                     score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
                     # Weighted sum as compared to human best (inverse since weighted score is being minimized)
                     reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
                     return state, reward, True, truncated, info
-
-            self.solution.cycle_movement()
-
-            if self.solution.does_it_halt():  # Detects infinite loops and fast-forwards cycles to completion
-                score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
-                # Weighted sum as compared to human best (inverse since weighted score is being minimized)
-                reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
-                return state, reward, True, truncated, info
+            except SolutionRunError as e:  # Any other error would be an error in the env itself
+                # If there was a reaction error or an infinite loop occurred, return a negative reward based on the
+                # final reactor state.
+                info['error'] = str(e)
+                # If the solution crashed or an infinite loop occurred, return a negative reward based on the
+                # final reactor state.
+                return state, self.fail_reward(), True, truncated, info
 
         self.active_waldo = 1 - self.active_waldo  # Flip waldo
 
-        #state = self._observation()
-        return state, reward, terminated, truncated, info
+        state = self._observation()
+        return state, reward, False, truncated, info
 
     def reset(self):
+        """Reset the environment to the beginning of a new episode."""
         # TODO: Change levels if the agent beat the current level?
         self.solution.reset()
-        state = 0
-        return state
+
+        # TODO: clear solution features
+
+        # Remove solution waldos
+        for reactor in self.solution.reactors:
+            reactor.waldos = []
+
+        self._visited_posns = [set(), set()]
+        self.active_waldo = 0
+        self._placed_features = True  # TODO
+        self._placed_waldo_starts = False
+
+        return self._observation()
 
     def render(self):
         """Pretty-print the current reactor state human-readably."""
@@ -543,14 +612,26 @@ if __name__ == '__main__':
         if 'error' in info:
             print(info['error'])
     else:
+        num_episodes = 1000
         # As a proof-of-concept, generate and run an import-valid solution via Space.sample().
-        env = SChemEnvJustInTime()
-        try:
-            while True:
+        max_reward = -math.inf
+        best_soln = None
+        best_info = None
+        for _ in range(num_episodes):
+            env = SChemEnvJustInTime()
+            terminated = False
+            while not terminated:
                 obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
-                if 'error' in info:
-                    print(info['error'])
-                    break
-        finally:
-            print('\n' + env.solution.export_str() + '\n')
-            env.render()  # Print the final solution
+
+            if reward > max_reward:
+                max_reward = reward
+                best_soln = env.solution
+                best_info = info
+
+        print(f"Best result after {num_episodes} episodes:\n")
+        print(best_soln.export_str() + '\n')
+        # Pretty-print the best solution
+        rich.print(next(best_soln.reactors).__str__(show_instructions=True, flash_features=False))
+        if 'error' in best_info:
+            print(best_info['error'])
+        print(f"Reward: {max_reward}")
