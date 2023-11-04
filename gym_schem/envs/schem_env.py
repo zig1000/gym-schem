@@ -1,6 +1,7 @@
 import copy
 from enum import IntEnum
 import math
+import time
 
 import gymnasium as gym
 from gymnasium import error, spaces
@@ -299,6 +300,13 @@ class SChemEnvJustInTime(gym.Env):
             max_molecule_reward = 0
             for molecule in reactor.molecules:
                 molecule_reward = 0
+
+                # If the solution crashed while moving/rotating, the molecule will be on float coordinates and our
+                # isomoprhism algorithm will explode. The int coordinates are theoretically recoverable, but for now
+                # buster out. Note that all posns should be on float coords if any are, so only need to check one.
+                if isinstance(next(iter(molecule.atom_map)).col, float):
+                    continue
+
                 if molecule.isomorphic(output.output_molecule):
                     molecule_reward += 3  # Bonus for exact output molecule being in grid
 
@@ -412,6 +420,9 @@ class SChemEnvJustInTime(gym.Env):
         self.active_waldo = 0
         self._placed_features = True  # TODO
         self._placed_waldo_starts = False
+
+        # Hashing var that's dynamic and thus schem won't reset outside of Solution.run() (which we don't call)
+        self.solution._random_input_copies = [copy.deepcopy(i) for i in self.solution._random_inputs]
 
         return self._observation()
 
@@ -576,7 +587,7 @@ class SChemEnvStepWise(gym.Env):
     solution has improved since its highest score ever reached.
 
     A closer simulation of how players 'actually' play the game, tweaking a solution until it works or to improve it.
-    However, episodes may never end which might be tricky to train with.
+    However, episodes may never end which would be tricky to train with.
     """
     pass
 
@@ -586,7 +597,9 @@ class SchemEnvSolutionString(gym.Env):
     pass
 
 
-if __name__ == '__main__':
+def main():
+    # As a proof-of-concept, run random episodes and report the best score
+    start = time.time()
     if False:
         # As a proof-of-concept, generate and run an import-valid solution via Space.sample().
         env = SChemEnvOneShot()
@@ -612,26 +625,36 @@ if __name__ == '__main__':
         if 'error' in info:
             print(info['error'])
     else:
-        num_episodes = 1000
         # As a proof-of-concept, generate and run an import-valid solution via Space.sample().
         max_reward = -math.inf
         best_soln = None
         best_info = None
-        for _ in range(num_episodes):
-            env = SChemEnvJustInTime()
-            terminated = False
-            while not terminated:
-                obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+        eps = 0
+        env = SChemEnvJustInTime()
+        try:
+            while True:
+                terminated = False
+                while not terminated:
+                    obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
 
-            if reward > max_reward:
-                max_reward = reward
-                best_soln = env.solution
-                best_info = info
+                if reward > max_reward:
+                    max_reward = reward
+                    best_soln = copy.deepcopy(env.solution)  # reset() resets the solution so need to copy it
+                    best_info = info
 
-        print(f"Best result after {num_episodes} episodes:\n")
-        print(best_soln.export_str() + '\n')
-        # Pretty-print the best solution
-        rich.print(next(best_soln.reactors).__str__(show_instructions=True, flash_features=False))
-        if 'error' in best_info:
-            print(best_info['error'])
-        print(f"Reward: {max_reward}")
+                eps += 1
+                env.reset()
+        except KeyboardInterrupt:
+            print(f"Best result after {eps} episodes:\n")
+            print(best_soln.export_str() + '\n')
+            # Pretty-print the best solution
+            rich.print(next(best_soln.reactors).__str__(show_instructions=True, flash_features=False))
+            if 'error' in best_info:
+                print(best_info['error'])
+            print(f"Reward: {max_reward}")
+
+    print(f"Elapsed time: {time.time() - start:.1f}s")
+
+
+if __name__ == '__main__':
+    main()
