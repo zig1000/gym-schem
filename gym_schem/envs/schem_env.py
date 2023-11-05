@@ -1,21 +1,18 @@
 import copy
-from enum import IntEnum
 import math
-import time
 
 import gymnasium as gym
 from gymnasium import error, spaces
 from gymnasium.spaces import Box, Dict, Discrete, Tuple
 import numpy as np
 import rich
-
 import schem
 from schem import *
 from schem.components import Reactor, RandomInput
 from schem.grid import Direction, Position, CARDINAL_DIRECTIONS, RIGHT, DOWN
 from schem.waldo import Waldo, Instruction, InstructionType
 
-from human_scores import top_human_score_weighted
+from gym_schem.utils.human_scores import top_human_score_weighted
 
 ROTATIONAL_DIRECTIONS = (Direction.CLOCKWISE, Direction.COUNTER_CLOCKWISE)
 NUM_WALDOS, NUM_COLS, NUM_ROWS = Reactor.NUM_WALDOS, Reactor.NUM_COLS, Reactor.NUM_ROWS
@@ -165,33 +162,20 @@ def _shared_observation(solution: Solution,
     return obs
 
 
-# TODO: It is probably better to avoid this 'alternating actions' scheme and have each step() accept both an arrow
-#       and an instruction, since neither can 'affect' the result of the other (insofar as order doesn't matter).
-#       This way the only alternating state is the waldo being placed. We could merge the waldo steps too but then
-#       we lose the 'symmetry' of the waldos and double the output size, not that it's large anyway.
-#       PLUS if we merge all the action spaces, the 'waldo Start phase' is not special; we simply ignore the
-#       instruction part of the input and read from the cell + direction parts.
-class SChemEnvJustInTime(gym.Env):
-    """An SChemEnv implementation in which solution symbols are placed just-in-time while the solution is being run.
-    When revisiting a grid cell in which the agent was already given the opportunity to place a symbol (whether or not
-    they did), that cycle is fast-forwarded past, with step() potentially simulating multiple cycles per step.
-
-    Problem: fast-forwarding cycles means either skipping observations or a dynamic observation size. Could only show
-             the new frames, accept being dynamic, or have steps where the given action is ignored.
-             It'd be nice for this version of the env to be the one with static observation size though.
+class SChemEnv(gym.Env):
+    """An SChem env implementation in which solution symbols are placed just-in-time while the solution is being run.
 
     In full, a run proceeds as follows:
-    first N step() calls: Agent must select a (col, row) coordinate to place each feature in turn until all N features
-                          (bonders, sensor, fuser, etc.) of the level are placed.
-    Next 2 step() calls: Agent must select a coordinate for the current waldo's start location, along with the Start
-                         command's direction and any arrow for the starting cell.
-    Remaining step() calls: Agent alternates placement for each waldo (red then blue), placing up to one command and one
-        arrow per step. After blue steps, cycle movement is performed.
-        he observation space will include a value indicating which waldo the current step is for,
-        and will skip a waldo's step() during a cycle if it is in a grid cell it has already visited
-        (e.g. flip-flops can't be placed only on the second time a grid cell is
-        visited, even though they wouldn't have affected the first pass).
-        TODO: maybe allow the flip-flop case to make it easier for the agent to learn what they do?
+    * First N steps: Agent must select a (col, row) coordinate to place each feature in turn until all N 'features'
+      (bonders, sensor, fuser, etc.) of the level are placed (the first level has 0 features).
+    * Next 2 steps: Agent must select a coordinate for the current waldo's start location, along with the Start
+      command's direction and any arrow for the starting cell.
+    * Remaining steps: Each cycle of the solution has 2 steps: the agent alternates placement for each waldo
+        (red then blue), placing up to one command and one arrow in the waldo's current cell to be immediately
+        executed. Reactor movement is also performed at the end of blue steps.
+        The observation space includes a value indicating which waldo the current step is for, and ignores the action if
+        it is in a grid cell the current waldo has previously passed through.
+        TODO: In future placing flip-flops may be allowed on the second pass through a cell.
     """
     metadata = {'render.modes': ['human']}
     last_level_solved = -1
@@ -595,66 +579,3 @@ class SChemEnvStepWise(gym.Env):
 class SchemEnvSolutionString(gym.Env):
     """An SChem env where each action is a solution string as exported by SC CE."""
     pass
-
-
-def main():
-    # As a proof-of-concept, run random episodes and report the best score
-    start = time.time()
-    if False:
-        # As a proof-of-concept, generate and run an import-valid solution via Space.sample().
-        env = SChemEnvOneShot()
-        sample_action = env.action_space.sample()
-
-        # Give the fully-random action some help to become validly importable
-        ## Zero the features since pancakes has none
-        sample_action['features'] = np.zeros(env.action_space['features'].shape,
-                                             dtype=env.action_space['features'].dtype)
-
-        ## Zero all Start and illegal instrs, then re-randomize starts
-        for waldo_grid in sample_action['waldo_commands']:
-            for row in waldo_grid:
-                for instr_one_hot in row:
-                    instr_one_hot[1] = 0  # Zero out Start
-                    for i in range(9, len(instr_one_hot)):  # Zero out bond instruction and above
-                        instr_one_hot[i] = 0
-
-        sample_action['waldo_commands'][0][np.random.randint(NUM_ROWS)][np.random.randint(NUM_COLS)][1] = 1
-        sample_action['waldo_commands'][1][np.random.randint(NUM_ROWS)][np.random.randint(NUM_COLS)][1] = 1
-
-        obs, reward, terminated, truncated, info = env.step(sample_action)
-        if 'error' in info:
-            print(info['error'])
-    else:
-        # As a proof-of-concept, generate and run an import-valid solution via Space.sample().
-        max_reward = -math.inf
-        best_soln = None
-        best_info = None
-        eps = 0
-        env = SChemEnvJustInTime()
-        try:
-            while True:
-                terminated = False
-                while not terminated:
-                    obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
-
-                if reward > max_reward:
-                    max_reward = reward
-                    best_soln = copy.deepcopy(env.solution)  # reset() resets the solution so need to copy it
-                    best_info = info
-
-                eps += 1
-                env.reset()
-        except KeyboardInterrupt:
-            print(f"Best result after {eps} episodes:\n")
-            print(best_soln.export_str() + '\n')
-            # Pretty-print the best solution
-            rich.print(next(best_soln.reactors).__str__(show_instructions=True, flash_features=False))
-            if 'error' in best_info:
-                print(best_info['error'])
-            print(f"Reward: {max_reward}")
-
-    print(f"Elapsed time: {time.time() - start:.1f}s")
-
-
-if __name__ == '__main__':
-    main()
