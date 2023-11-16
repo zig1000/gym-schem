@@ -1,5 +1,6 @@
 import copy
 import math
+from typing import Optional
 
 import gymnasium as gym
 from gymnasium import error, spaces
@@ -16,7 +17,8 @@ from gym_schem.utils.human_scores import top_human_score_weighted
 
 ROTATIONAL_DIRECTIONS = (Direction.CLOCKWISE, Direction.COUNTER_CLOCKWISE)
 NUM_WALDOS, NUM_COLS, NUM_ROWS = Reactor.NUM_WALDOS, Reactor.NUM_COLS, Reactor.NUM_ROWS
-INSTR_IDX_TO_TYPE = list(schem.waldo.InstructionType)  # Mapping of instruction action indices to schem's native enum
+INSTR_IDX_TO_TYPE = list(InstructionType)  # Mapping of instruction action indices to schem's native enum
+INSTR_TYPE_TO_IDX = {t: i for i, t in enumerate(InstructionType)}
 # Note that 'bonder' is not included as we're going to demark it by both bond+ and bond- being selected.
 FEATURE_IDX_TO_NAME = ['bonder-plus', 'bonder-minus', 'sensor', 'fuser', 'splitter', 'tunnel']
 
@@ -64,7 +66,7 @@ shared_observation_dict = {
     # the UP & DOWN encodings for each to preserve them being 'opposites'.
     'waldo_command_directions': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS, 4), dtype=bool, low=0, high=1),
     # Element associated with Sense commands (note that it can't be Australium)
-    'waldo_command_elements': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=np.int16, low=1, high=203),
+    'waldo_command_elements': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=np.int16, low=0, high=203),
     # 1 if there is an active flip-flop in the given position
     'waldo_flip_flop_states': Box(shape=(NUM_WALDOS, NUM_ROWS, NUM_COLS), dtype=bool, low=0, high=1)}
 
@@ -177,31 +179,32 @@ class SChemEnv(gym.Env):
         it is in a grid cell the current waldo has previously passed through.
         TODO: In future placing flip-flops may be allowed on the second pass through a cell.
     """
-    metadata = {'render.modes': ['human']}
-    last_level_solved = -1
+    metadata = {'render_modes': ['human']}
+    reward_range = (-10, 2)  # Max is 1, realistically
+    observation_space = Dict({**shared_observation_dict,
+                              # Number of each feature the solution will include
+                              'total_features': Box(shape=(6,), dtype=np.int8, low=0, high=8),
+                              # Helper feature so the agent doesn't have to learn what order features get
+                              # placed in. Indicates which feature is about to be placed.
+                              # Same encoding as placed features:
+                              # (none, bonder+, bonder-, sensor, fuser, splitter, swapper)
+                              # where +- bonders get a 1 in both the + and - slots.
+                              'feature_being_placed': Box(shape=(7,), dtype=np.int8, low=0, high=1),
+                              # Which waldo is being placed. 0=red, 1=blue. 0 during feature placement.
+                              'waldo_being_placed': Discrete(2)})
+    action_space = Dict({
+        # col/row only used during feature and waldo Start placement
+        'col': Box(shape=(1,), dtype=np.int8, low=0, high=Reactor.NUM_COLS - 1),
+        'row': Box(shape=(1,), dtype=np.int8, low=0, high=Reactor.NUM_ROWS - 1),
+        'arrow': Discrete(5),  # NONE, UP, RIGHT, DOWN, LEFT
+        'command': Discrete(len(InstructionType) - 2),  # 0 = no command, and we exclude START, CTRL, and PAUSE
+        'command_direction': Discrete(4),  # Used by Start, Sense, Flip-Flop, Input, and Output
+        # Box not Discrete since atomic number is in some sense 'ordered'?
+        'command_element': Box(shape=(1,), dtype=np.int16, low=1, high=203)})  # Only used by sense.
 
+    # TODO: Accept level or level index, and ensure non-research levels are filtered out
     def __init__(self, optimization_goal=(0.99, 0, 0.01), render_mode=None):
-        # Gymnasium API properties
-        self.observation_space = Dict({**shared_observation_dict,
-                                       # Number of each feature the solution will include
-                                       'total_features': Box(shape=(6,), dtype=np.int8, low=0, high=8),
-                                       # Helper feature so the agent doesn't have to learn what order features get
-                                       # placed in. Indicates which feature is about to be placed.
-                                       # Same encoding as placed features:
-                                       # (none, bonder+, bonder-, sensor, fuser, splitter, swapper)
-                                       # where +- bonders get a 1 in both the + and - slots.
-                                       'feature_being_placed': Box(shape=(7,), dtype=np.int8, low=0, high=1),
-                                       # Which waldo is being placed. 0=red, 1=blue. 0 during feature placement.
-                                       'waldo_being_placed': Discrete(2)})
-        self.action_space = Dict({
-            # col/row only used during feature and waldo Start placement
-            'col': Box(shape=(1,), dtype=np.int8, low=0, high=Reactor.NUM_COLS - 1),
-            'row': Box(shape=(1,), dtype=np.int8, low=0, high=Reactor.NUM_ROWS - 1),
-            'arrow': Discrete(5),  # NONE, UP, RIGHT, DOWN, LEFT
-            'command': Discrete(len(InstructionType) - 2),  # 0 = no command, and we exclude START, CTRL, and PAUSE
-            'command_direction': Discrete(4),  # Ignored for non-directional instructions. Used for waldo Start.
-            # Box not Discrete since atomic number is in some sense 'ordered'?
-            'command_element': Box(shape=(1,), dtype=np.int16, low=1, high=203)})  # Only used by sense.
+        self.render_mode = render_mode
 
         # Internal vars
         self.level = schem.Level(next(iter(schem.levels.values())))  # Of Pancakes and Spaceships
@@ -250,6 +253,8 @@ class SChemEnv(gym.Env):
         obs = _shared_observation(solution=self.solution, optimization_goal=self.optimization_goal,
                                   include_waldo_layers=True)
         # Add parts of the observation specific to this variant of the env
+        obs['total_features'] = np.zeros((6,), dtype=np.int8)
+        obs['feature_being_placed'] = np.zeros((7,), dtype=np.int8)
         obs['waldo_being_placed'] = self.active_waldo
         return obs
 
@@ -320,7 +325,7 @@ class SChemEnv(gym.Env):
 
             return state, reward, terminated, truncated, info
 
-        # Skip command/arrow placement if the current waldo has already visited this cell
+        # Command/arrow placement (skipped if the current waldo has already visited this cell)
         if (len(reactor.waldos) < 2
                 or reactor.waldos[self.active_waldo].position not in self._visited_posns[self.active_waldo]):
             posn = Position(col=action['col'][0], row=action['row'][0])
@@ -334,12 +339,12 @@ class SChemEnv(gym.Env):
                 instr_type = INSTR_IDX_TO_TYPE[action['command']]  # No-op action replaced Start, so no offset needed
                 dirn = (CARDINAL_DIRECTIONS[action['command_direction']]
                         if instr_type != InstructionType.ROTATE
-                        else ROTATIONAL_DIRECTIONS[action['command_direction'] % 2])
+                        else ROTATIONAL_DIRECTIONS[action['command_direction'] % 2])  # up/down = c-wise, right/left = cc-wise
 
                 # Used by input/output and sense.
-                target_idx = (action['command_element']
+                target_idx = (action['command_element'][0]
                               if instr_type == InstructionType.SENSE
-                              else int(action['command_direction'] <= 1))
+                              else int(action['command_direction'] > 1))  # Rigged so UP = Alpha and DOWN = Beta
 
                 # TODO: schem should ignore dirn/target on instructions that don't use them; currently it sets them.
                 waldo = reactor.waldos[self.active_waldo]
@@ -364,7 +369,7 @@ class SChemEnv(gym.Env):
                 for component in self.solution.components:
                     if (component.do_instant_actions(self.solution.cycle)  # True if it's an Output that just completed
                             and all(output.current_count >= output.target_count for output in self.solution.outputs)):
-                        score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
+                        score = Score(self.solution.cycle - 1, len(list(self.solution.reactors)), self.solution.symbols)
                         # Weighted sum as compared to human best (inverse since weighted score is being minimized)
                         reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
                         return state, reward, True, truncated, info
@@ -372,7 +377,7 @@ class SChemEnv(gym.Env):
                 self.solution.cycle_movement()
 
                 if self.solution.does_it_halt():  # Detects infinite loops and fast-forwards cycles to completion
-                    score = Score(self.cycle - 1, len(self.solution.reactors), self.symbols)
+                    score = Score(self.solution.cycle - 1, len(list(self.solution.reactors)), self.solution.symbols)
                     # Weighted sum as compared to human best (inverse since weighted score is being minimized)
                     reward = self.top_human_score_weighted / sum(w * m for w, m in zip(self.optimization_goal, score))
                     return state, reward, True, truncated, info
@@ -389,7 +394,7 @@ class SChemEnv(gym.Env):
         state = self._observation()
         return state, reward, False, truncated, info
 
-    def reset(self):
+    def reset(self, **kwargs):  # Accept and ignore whatever random-ass shit stable baselines etc. still expect to exist
         """Reset the environment to the beginning of a new episode."""
         # TODO: Change levels if the agent beat the current level?
         self.solution.reset()
@@ -408,11 +413,66 @@ class SChemEnv(gym.Env):
         # Hashing var that's dynamic and thus schem won't reset outside of Solution.run() (which we don't call)
         self.solution._random_input_copies = [copy.deepcopy(i) for i in self.solution._random_inputs]
 
-        return self._observation()
+        return self._observation(), {}
 
-    def render(self):
+    def render(self, **kwargs):
         """Pretty-print the current reactor state human-readably."""
         rich.print(next(self.solution.reactors).__str__(show_instructions=True, flash_features=False))
+
+    @classmethod
+    def solution_to_actions(cls, soln_str: str, level_str: Optional[str] = None):
+        """Given a solution export string, return a list of actions that would reproduce it in this env."""
+        solution = Solution(soln_str, level=level_str)
+        reactor = next(solution.reactors)  # TODO: Productionize
+        actions = []
+
+        # TODO: record feature steps
+
+        # Prep schem-internal vars needed for does_it_halt
+        solution._random_inputs = [c for c in solution.components if isinstance(c, RandomInput)]
+        solution._random_input_copies = [copy.deepcopy(i) for i in solution._random_inputs]
+
+        # Step through the solution cycle by cycle, recording waldo instructions for newly-reached cells
+        waldo_visited_cells = [set(), set()]
+        while True:
+            # Record waldo instructions and arrows
+            for w, waldo in enumerate(reactor.waldos):
+                action = {space_key: np.zeros(shape=space.shape, dtype=space.dtype)
+                          for space_key, space in cls.action_space.items()}
+                if not waldo.position in waldo_visited_cells[w]:
+                    waldo_visited_cells[w].add(waldo.position)
+                    action['col'][0], action['row'][0] = waldo.position  # Only relevant for Start steps but why not
+                    if waldo.position in waldo.commands:
+                        cmd = waldo.commands[waldo.position]
+                        action['command'] = INSTR_TYPE_TO_IDX[cmd.type]
+                        if cmd.direction is not None:
+                            if cmd.type == InstructionType.ROTATE:
+                                action['command_direction'] = int(cmd.direction == Direction.COUNTER_CLOCKWISE)
+                            else:
+                                action['command_direction'] = cmd.direction.value
+                        if cmd.target_idx is not None:
+                            # Edge case because we wanted direction to control input/output, which doesn't match schem.
+                            if cmd.type in {InstructionType.INPUT, InstructionType.OUTPUT}:
+                                action['command_direction'] = cmd.target_idx * 2  # UP for alpha, DOWN for beta
+                            else:
+                                action['command_element'][0] = cmd.target_idx
+
+                    if waldo.position in waldo.arrows:
+                        action['arrow'] = waldo.arrows[waldo.position].value + 1  # Recall that 0 = no arrow
+
+                actions.append(action)
+
+            # Execute cycle
+            solution.cycle += 1
+            for component in solution.components:
+                if (component.do_instant_actions(solution.cycle)  # True if it's an Output that just completed
+                        and all(output.current_count >= output.target_count for output in solution.outputs)):
+                    return actions
+
+            solution.cycle_movement()
+
+            if solution.does_it_halt():  # Detects infinite loops and fast-forwards cycles to completion
+                return actions
 
 
 # TODO: Allow an already-partially-constructed solution to be used as the input for the OneShot env, even though the

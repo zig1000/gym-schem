@@ -1,1 +1,1 @@
-from gym_schem.envs.schem_env import SChemEnv, SChemEnvOneShot
+from .schem_env import SChemEnv, SChemEnvOneShot
